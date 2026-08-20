@@ -18,15 +18,33 @@ contract MultisigHandler is Test {
     /// @notice Number of times execute *succeeded* for a txId (must never exceed 1).
     mapping(uint256 => uint256) public executeSuccessCount;
 
+    /// @notice Spare addresses used to rotate the owner set.
+    address[] public spares;
+    /// @notice Set true if any execute ever succeeded while the tx had fewer than
+    ///         `threshold` confirmations from the CURRENT owner set. Must stay
+    ///         false: a tx may only execute on live-owner approval.
+    bool public sawUnderThresholdExecute;
+
     constructor(MultisigWallet wallet_, address[] memory owners_) {
         wallet = wallet_;
         owners = owners_;
+        for (uint256 i = 0; i < 6; ++i) {
+            spares.push(address(uint160(uint256(keccak256(abi.encode("spare", i))))));
+        }
         // Fund the wallet so ETH-sending txs can succeed.
         vm.deal(address(wallet), 1_000 ether);
     }
 
     function _owner(uint256 seed) internal view returns (address) {
         return owners[seed % owners.length];
+    }
+
+    /// @dev Confirmations of `txId` counted over the CURRENT owner set only.
+    function _currentConfirmations(uint256 txId) internal view returns (uint256 c) {
+        address[] memory os = wallet.getOwners();
+        for (uint256 i = 0; i < os.length; ++i) {
+            if (wallet.confirmedBy(txId, os[i])) c++;
+        }
     }
 
     function submit(uint256 ownerSeed, uint256 value) external {
@@ -65,14 +83,50 @@ contract MultisigHandler is Test {
         if (txIds.length == 0) return;
         uint256 txId = txIds[txSeed % txIds.length];
         address o = _owner(ownerSeed);
-        (,,, bool executed, uint256 confirmations) = wallet.getTransaction(txId);
+        (,,, bool executed,) = wallet.getTransaction(txId);
         if (executed) return;
-        if (confirmations < wallet.threshold()) return;
+        // Snapshot the live-owner confirmation count and threshold BEFORE trying;
+        // attempt the execute regardless so the fix's gate is what decides.
+        uint256 liveConf = _currentConfirmations(txId);
+        uint256 t = wallet.threshold();
         vm.prank(o);
         try wallet.executeTransaction(txId) {
             everExecuted[txId] = true;
             executeSuccessCount[txId] += 1;
+            // A success with fewer than `threshold` live-owner confirmations would
+            // mean a stale/removed-owner confirmation pushed it over the line.
+            if (liveConf < t) sawUnderThresholdExecute = true;
         } catch {}
+    }
+
+    /// @dev Rotate a current owner out for a spare, changing the owner set so any
+    ///      gathered confirmations from the removed owner become stale.
+    function rotateOwner(uint256 ownerSeed, uint256 spareSeed) external {
+        if (spares.length == 0) return;
+        address oldOwner = _owner(ownerSeed);
+        uint256 si = spareSeed % spares.length;
+        address newOwner = spares[si];
+        if (wallet.isOwner(newOwner) || newOwner == address(0)) return;
+
+        vm.prank(address(wallet));
+        try wallet.replaceOwner(oldOwner, newOwner) {
+            // Reflect the change in the handler's live owner list + spare pool.
+            for (uint256 i = 0; i < owners.length; ++i) {
+                if (owners[i] == oldOwner) {
+                    owners[i] = newOwner;
+                    break;
+                }
+            }
+            spares[si] = oldOwner;
+        } catch {}
+    }
+
+    /// @dev Change the threshold to any valid value in [1, ownerCount].
+    function changeThreshold(uint256 seed) external {
+        uint256 n = wallet.ownerCount();
+        uint256 t = (seed % n) + 1;
+        vm.prank(address(wallet));
+        try wallet.changeThreshold(t) {} catch {}
     }
 
     function txIdsLength() external view returns (uint256) {
@@ -107,21 +161,32 @@ contract MultisigInvariantTest is StdInvariant, Test {
         }
     }
 
-    /// @notice On-chain confirmation count for a tx equals the number of current
-    ///         owners that are recorded as confirming it.
+    /// @notice The reported confirmation count (which governs execution) always
+    ///         equals the number of CURRENT owners recorded as confirming the tx,
+    ///         even after owners have been rotated. This is the property that
+    ///         makes a removed owner's stale confirmation stop counting.
     function invariant_ConfirmationCountMatchesOwners() public view {
         uint256 n = handler.txIdsLength();
         address[] memory os = wallet.getOwners();
         for (uint256 i = 0; i < n; ++i) {
             uint256 txId = handler.txIds(i);
-            (,,, bool executed, uint256 confirmations) = wallet.getTransaction(txId);
+            (,,, bool executed,) = wallet.getTransaction(txId);
             if (executed) continue;
             uint256 counted;
             for (uint256 j = 0; j < os.length; ++j) {
                 if (wallet.confirmedBy(txId, os[j])) counted++;
             }
-            assertEq(confirmations, counted, "confirmation count mismatch");
+            assertEq(wallet.getConfirmationCount(txId), counted, "confirmation count mismatch");
+            // The confirming-owners view lists exactly those current owners.
+            assertEq(wallet.getConfirmations(txId).length, counted, "getConfirmations length mismatch");
         }
+    }
+
+    /// @notice A transaction only ever executes when at least `threshold` of the
+    ///         CURRENT owners confirmed it. Rotating owners cannot let a stale
+    ///         confirmation carry a tx over the threshold.
+    function invariant_ExecutesOnlyOnLiveThreshold() public view {
+        assertFalse(handler.sawUnderThresholdExecute(), "tx executed below live-owner threshold");
     }
 
     /// @notice An executed tx must have had >= threshold confirmations, i.e. the

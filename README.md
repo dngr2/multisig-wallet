@@ -64,3 +64,36 @@ confirming owners, owner set stays valid).
 ## License
 
 MIT
+
+## Deep dive (v2): hardening + EIP-712 signatures, deadlines, live-owner confirmations
+
+Second-pass review and hardening of the deployed contracts.
+
+**Security fix — stale confirmation after owner change.** Execution now counts
+confirmations against the *current* owner set rather than a cached counter. A
+confirmation left behind by an owner who is later removed or replaced no longer
+counts toward the threshold, so a transaction can never execute with fewer than
+`threshold` live-owner approvals. `isConfirmed`, `getConfirmationCount` and the
+new `getConfirmations` view all reflect the live owner set. Reentrancy, the
+CEI/executed-flag ordering, threshold bounds and factory fee bounds were
+re-reviewed and found sound (no change).
+
+**Features.**
+- `executeWithSignatures` — Safe-style EIP-712 execution: a single caller (e.g. a
+  relayer) submits a batch of owner signatures over `(to, value, data, nonce,
+  deadline)` and the call executes in one transaction, no on-chain
+  submit/confirm round-trip. Signatures must be ordered by ascending signer
+  address (enforcing uniqueness), each signer a current owner, at least
+  `threshold` of them. A monotonic `execNonce` and the EIP-712 domain prevent
+  replay across calls and chains; a failed inner call reverts the nonce so the
+  bundle stays retryable.
+- Per-tx expiry via `submitTransactionWithDeadline`; `executeTransaction` (and the
+  signature flow) reject expired transactions. `getDeadline(txId)` reads it.
+- `getConfirmations(txId)` lists the current owners confirming a transaction.
+
+**Tests.** Regression tests for the stale-confirmation case (removed and replaced
+owner), the full EIP-712 flow (happy path, replay, too-few/non-owner/duplicate/
+unordered signers, expired deadline, failed-call nonce retention, self-governance
+via signatures), deadlines, and the new view. The invariant suite now fuzzes
+owner rotation and threshold changes and asserts a transaction only ever executes
+on live-owner threshold.

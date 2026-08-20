@@ -90,8 +90,12 @@ contract MultisigFactory is Ownable {
 
         _allWallets.push(wallet);
         _walletsByCreator[msg.sender].push(wallet);
-        for (uint256 i = 0; i < owners.length; ++i) {
+        uint256 len = owners.length;
+        for (uint256 i = 0; i < len;) {
             _walletsByOwner[owners[i]].push(wallet);
+            unchecked {
+                ++i;
+            }
         }
 
         if (required > 0) {
